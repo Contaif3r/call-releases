@@ -1,0 +1,94 @@
+# Gera os instaladores do Call (Windows + Mac) a partir do código do repositório privado
+# Contaif3r/projeto-call. Roda aqui, no repositório público, porque o GitHub Actions é
+# gratuito para repositórios públicos (inclusive as máquinas Mac).
+#
+# - O código é baixado com uma deploy key SÓ DE LEITURA do projeto-call (segredo
+#   PROJETO_CALL_DEPLOY_KEY); ele não é publicado aqui, só os instaladores (que já são públicos).
+# - Só roda quando alguém com acesso de escrita dispara (workflow_dispatch); pull requests
+#   de terceiros não rodam este workflow nem veem os segredos.
+# - Disparado por `npm run release` no projeto-call.
+name: Build
+run-name: Build ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit (ou branch) do projeto-call
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            script: dist
+            files: |
+              dist/*.exe
+              dist/*.blockmap
+              dist/latest.yml
+          - os: macos-latest
+            script: dist:mac
+            files: |
+              dist/*.dmg
+              dist/*.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Contaif3r/projeto-call
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.PROJETO_CALL_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+      # Mac: instala o certificado autoassinado FIXO (secrets) num keychain temporário.
+      # Assinar sempre com a mesma identidade faz o macOS lembrar as permissões.
+      - name: Certificado de assinatura (Mac)
+        if: runner.os == 'macOS'
+        env:
+          P12: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          PASS: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          PASS=$(printf '%s' "$PASS" | tr -d '\r\n')
+          printf '%s' "$P12" | tr -d '\r\n ' | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          KC="$RUNNER_TEMP/build.keychain-db"
+          security create-keychain -p ci "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p ci "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$PASS" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$KC"
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -passin "pass:$PASS" -nokeys -out "$RUNNER_TEMP/cert.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/cert.pem"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$KC"
+          echo "MAC_SIGN_IDENTITY=Call Self-Signed Code Signing" >> "$GITHUB_ENV"
+
+      - run: npm run ${{ matrix.script }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Conferir assinatura (Mac)
+        if: runner.os == 'macOS'
+        run: |
+          APP=$(ls -d dist/mac*/Call.app | head -1)
+          codesign -dv --verbose=2 "$APP" 2>&1 | grep -E "Authority|Identifier|TeamIdentifier"
+          codesign -dv --verbose=2 "$APP/Contents/Resources/native/sysaudio-mac" 2>&1 | grep -E "Authority"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: call-${{ matrix.os }}
+          path: ${{ matrix.files }}
+          if-no-files-found: error
+          retention-days: 7
